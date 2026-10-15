@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Sniffer WiFi (ESP32-S3 + ENC28J60)</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #0d1117; color: #c9d1d9; padding: 24px; line-height: 1.6; }
+h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-bottom: 20px; }
+h2 { color: #58a6ff; margin-top: 28px; margin-bottom: 12px; font-size: 1.3rem; }
+h3 { color: #79c0ff; margin-top: 20px; margin-bottom: 8px; font-size: 1.1rem; }
+h4 { color: #a5d6ff; margin-top: 16px; margin-bottom: 6px; font-size: 1rem; }
+p { margin-bottom: 12px; }
+a { color: #58a6ff; }
+ul, ol { margin-left: 24px; margin-bottom: 12px; }
+li { margin-bottom: 4px; }
+code { background: #161b22; padding: 2px 6px; border-radius: 4px;
+       font-family: 'Consolas', monospace; font-size: 12px; color: #79c0ff; }
+pre { background: #161b22; padding: 16px; border-radius: 6px; overflow-x: auto;
+      margin-bottom: 12px; border: 1px solid #30363d; }
+pre code { background: none; padding: 0; color: #c9d1d9; }
+table { border-collapse: collapse; margin-bottom: 16px; width: 100%; }
+th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; vertical-align: top; }
+th { background: #1f2937; color: #58a6ff; }
+.note { background: #1f6feb22; border-left: 3px solid #58a6ff; padding: 12px 16px; margin-bottom: 16px; border-radius: 4px; }
+.warn { background: #d2992222; border-left: 3px solid #d29922; padding: 12px 16px; margin-bottom: 16px; border-radius: 4px; }
+.toc { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; }
+.toc ol { columns: 2; margin-bottom: 0; }
+</style>
+</head>
+<body>
+<h1>Sniffer WiFi &mdash; ESP32-S3 + ENC28J60</h1>
+
+<p>Progetto <code>projects/sniffer_wifi</code>. L'ESP32-S3 fa da <b>router intermedio con cattura</b>: da un lato
+una porta <b>Ethernet</b> (modulo ENC28J60, verso un PC con condivisione di connessione o verso un router), dall'altro un
+<b>access point Wi-Fi aperto</b> (<code>LoggerWIFI</code>) a cui si collega lo smartphone da analizzare. Il traffico dello
+smartphone esce su Internet tramite NAT e, nel frattempo, ogni frame che passa dall'AP viene copiato sulla <b>porta USB nativa</b>
+verso il PC, dove uno script lo trasforma in un flusso <code>pcap</code> per <b>Wireshark</b>.</p>
+
+<div class="toc"><b>Indice</b>
+<ol>
+<li><a href="#schema">Schema generale</a></li>
+<li><a href="#collegamenti">Collegamenti hardware</a></li>
+<li><a href="#software">Struttura del firmware e avvio</a></li>
+<li><a href="#rete">Rete: Ethernet, AP e NAT</a></li>
+<li><a href="#pannello">Pannello web</a></li>
+<li><a href="#nvs">Configurazione salvata (NVS)</a></li>
+<li><a href="#cattura">Cattura e Wireshark</a></li>
+<li><a href="#filtro">Filtro di cattura</a></li>
+<li><a href="#build">Compilazione, flash e monitor</a></li>
+<li><a href="#problemi">Problemi frequenti</a></li>
+<li><a href="#verifiche">Cosa &egrave; stato verificato e cosa no</a></li>
+<li><a href="#limiti">Limiti</a></li>
+</ol></div>
+
+<h2 id="schema">1. Schema generale</h2>
+<pre><code>  Internet
+     |
+ [router o PC con condivisione]        192.168.137.1 (Windows ICS) oppure il tuo router
+     |  cavo Ethernet (10 Mbps)
+ [ENC28J60] --SPI-- [ESP32-S3]  ----- USB nativa ----&gt; PC: pcap_bridge.py | Wireshark
+                       |  NAT (NAPT) + cattura dei frame
+                    AP Wi-Fi "LoggerWIFI" 192.168.4.1/24 (aperto, max 4 client)
+                       |
+                   smartphone (192.168.4.x)</code></pre>
+<ul>
+<li>Il <b>pannello web</b> dello sniffer &egrave; raggiungibile sia dall'AP (<code>http://192.168.4.1</code>) sia dall'IP Ethernet.</li>
+<li>La <b>console di log</b> (monitor seriale) esce sulla UART; la <b>USB nativa</b> &egrave; riservata al flusso di cattura. Servono quindi due cavi USB se vuoi insieme log e cattura.</li>
+<li>La cattura vede il traffico <b>dell'interfaccia AP</b> (smartphone &harr; ESP), in entrambe le direzioni, non quello della porta Ethernet.</li>
+</ul>
+
+<h2 id="collegamenti">2. Collegamenti hardware</h2>
+<table>
+<tr><th>ENC28J60</th><th>ESP32-S3</th><th>Note</th></tr>
+<tr><td>SCK</td><td>GPIO14</td><td>SPI2 (<code>SPI2_HOST</code>)</td></tr>
+<tr><td>MISO (SO)</td><td>GPIO4</td><td></td></tr>
+<tr><td>MOSI (SI)</td><td>GPIO5</td><td></td></tr>
+<tr><td>CS</td><td>GPIO15</td><td></td></tr>
+<tr><td>INT</td><td>GPIO3</td><td>GPIO3 &egrave; un pin di <b>strapping</b>: se il boot d&agrave; problemi, sposta INT su un GPIO libero (6/7/8) in <code>main.c</code></td></tr>
+<tr><td>RST</td><td>GPIO9</td><td>il firmware lo pilota a ogni avvio (reset hardware, poi 100 ms di attesa)</td></tr>
+<tr><td>VCC</td><td>3V3</td><td>il modulo assorbe circa 200 mA: alimentazione robusta</td></tr>
+<tr><td>GND</td><td>GND</td><td>comune con la scheda</td></tr>
+</table>
+<ul>
+<li>Clock SPI a <b>4 MHz</b>: valore <b>verificato stabile sull'hardware</b>. Con 8 MHz, sul cablaggio provato, la lettura dei registri PHY fallisce (<code>wrong chip ID</code> anche se <code>revision: 6</code> viene letta bene). Si pu&ograve; riprovare 8 MHz solo con collegamenti molto corti e massa curata; per revisioni del chip precedenti alla B5 gli 8 MHz sono per&ograve; obbligatori.</li>
+<li>L'ENC28J60 non ha un MAC bruciato: il firmware assegna il MAC locale <code>02:00:00:12:34:56</code> dopo l'installazione del driver (<code>init()</code> resetta il chip e lo cancellerebbe).</li>
+<li>L'ENC28J60 &egrave; solo <b>10 Mbps half duplex</b>: nel log compare <code>working in 10Mbps / half duplex</code>. &Egrave; normale e basta per uno smartphone, ma &egrave; il limite di banda dell'intero sistema.</li>
+<li>Pin da evitare per altri usi: strapping (0, 3, 45, 46), USB nativa (19, 20), console UART (43, 44), flash/PSRAM ottale (26&ndash;37).</li>
+</ul>
+
+<h2 id="software">3. Struttura del firmware e avvio</h2>
+<table>
+<tr><th>File</th><th>Compito</th></tr>
+<tr><td><code>main/main.c</code></td><td>avvio, driver ENC28J60, access point, NAT, autotest radio, heartbeat nel log</td></tr>
+<tr><td><code>main/netcfg.c/.h</code></td><td>configurazione di rete persistente (Ethernet DHCP/IP fisso, parametri AP) con validazione, scrittura NVS e rilettura di verifica</td></tr>
+<tr><td><code>main/webcfg.c/.h</code></td><td>pannello web (porta 80): diagnostica AP, <code>/net</code>, <code>/filter</code>, <code>/wireshark</code>, ecc.</td></tr>
+<tr><td><code>main/capture.c/.h</code></td><td>aggancio ai frame dell'AP, buffer circolare in PSRAM, invio su USB-Serial-JTAG</td></tr>
+<tr><td><code>main/filter.c/.h</code></td><td>filtro di cattura a regole testuali, con IP appresi dal DNS</td></tr>
+<tr><td><code>tools/pcap_bridge.py</code></td><td>lato PC: legge lo stream USB e lo converte in pcap</td></tr>
+</table>
+<h3>Sequenza di avvio</h3>
+<ol>
+<li>Inizializzazione NVS, poi <code>netcfg_load()</code>: legge la configurazione di rete salvata (o usa i predefiniti) e lo scrive nel log.</li>
+<li>Stack di rete, servizio ISR dei GPIO (obbligatorio per il pin INT dell'ENC28J60), reset hardware del chip, bus SPI.</li>
+<li>Driver ENC28J60, MAC locale, collegamento al netif Ethernet.</li>
+<li>Applicazione dell'IP Ethernet (fisso subito; con DHCP il client parte da solo all'avvio dell'interfaccia), poi avvio Ethernet.</li>
+<li>Filtro di cattura (regole da NVS o predefinite) e cattura (buffer in PSRAM, driver USB).</li>
+<li>Access point con SSID, canale, potenza e visibilit&agrave; letti da NVS; larghezza di banda HT20; risparmio energetico Wi-Fi spento.</li>
+<li>Pannello web; autotest radio dopo 4 s; poi un <b>heartbeat nel log ogni 10 s</b> con frame catturati, scartati, stato USB e statistiche del filtro.</li>
+</ol>
+<p>L'autotest radio mette per un paio di secondi il Wi-Fi in modalit&agrave; AP+STA, scansiona le reti vicine (le prime 12 per segnale vengono scritte nel log) e torna in solo AP: serve a verificare antenna e ricezione. In quel momento l'AP pu&ograve; avere un breve disturbo.</p>
+
+<h2 id="rete">4. Rete: Ethernet, AP e NAT</h2>
+<h3>Ethernet: DHCP o IP fisso</h3>
+<p>Si sceglie dalla pagina <code>/net</code> del pannello. Predefinito, con NVS vuota: <b>IP fisso 192.168.137.200</b>, maschera 255.255.255.0, gateway e DNS 192.168.137.1 (la rete della condivisione di connessione di Windows).</p>
+<table>
+<tr><th>Scenario</th><th>Impostazione</th></tr>
+<tr><td>PC Windows con condivisione di connessione (ICS) collegato direttamente allo sniffer</td><td>IP fisso 192.168.137.200 (predefinito) oppure DHCP: ICS assegna un indirizzo della 192.168.137.x</td></tr>
+<tr><td>Router intermedio che assegna gli indirizzi</td><td>DHCP</td></tr>
+<tr><td>Rete con indirizzi tuoi</td><td>IP fisso con IP, maschera, gateway e DNS della tua rete (DNS vuoto = gateway)</td></tr>
+</table>
+<h3>Pulsanti della pagina <code>/net</code></h3>
+<ul>
+<li><b>Salva e applica ora</b>: salva in NVS e dopo circa 0,8 s applica a caldo (ferma il client DHCP o lo avvia, imposta IP/maschera/gateway/DNS, ricalcola il NAT). Il Wi-Fi dell'AP non si interrompe.</li>
+<li><b>Salva (vale dal prossimo riavvio)</b>: salva e basta; la rete attuale non cambia.</li>
+<li><b>Salva e riavvia</b>: salva e riavvia lo sniffer.</li>
+<li>Passando a DHCP gli ultimi valori fissi restano salvati, cos&igrave; si pu&ograve; tornare indietro senza riscriverli.</li>
+</ul>
+<div class="note">Se sei collegato via Ethernet e applichi un indirizzo diverso, la pagina smette di rispondere: riaprila al nuovo IP (con DHCP lo leggi in "Stato attuale" collegandoti al Wi-Fi <code>LoggerWIFI</code> su <code>http://192.168.4.1/net</code>). Dall'AP il pannello &egrave; sempre raggiungibile, quindi non si resta mai chiusi fuori.</div>
+<h3>Controlli sui valori inseriti</h3>
+<p>Il firmware rifiuta, con un messaggio, un IP non valido o non utilizzabile (0, loopback, multicast, indirizzo di rete o di broadcast), una maschera non contigua o pi&ugrave; piccola di /30, un gateway fuori dalla rete dell'IP o uguale all'IP, un DNS non valido. Rifiuta anche qualunque rete che si <b>sovrapponga a 192.168.4.0/24</b>, la rete dell'AP: con due reti uguali il NAT non pu&ograve; funzionare. Se il router a cui ti colleghi usa proprio la 192.168.4.x, la pagina mostra un avviso.</p>
+<h3>Access point</h3>
+<table>
+<tr><th>Parametro</th><th>Valore</th></tr>
+<tr><td>SSID</td><td><code>LoggerWIFI</code> (modificabile)</td></tr>
+<tr><td>Sicurezza</td><td><b>aperto</b>, senza password</td></tr>
+<tr><td>Canale</td><td>6 (modificabile 1&ndash;13), larghezza 20 MHz (HT20)</td></tr>
+<tr><td>Potenza</td><td>8 dBm di default (modificabile 2&ndash;20): oltre circa 9 dBm l'AP pu&ograve; diventare instabile per l'alimentazione della scheda</td></tr>
+<tr><td>Client</td><td>massimo 4</td></tr>
+<tr><td>Rete</td><td>192.168.4.0/24, l'ESP &egrave; 192.168.4.1 e assegna gli indirizzi ai client (DHCP dell'AP)</td></tr>
+</table>
+<h3>NAT</h3>
+<p>Quando Ethernet ottiene un indirizzo (o l'AP riparte) il firmware esegue il passaggio di NAT, che:</p>
+<ol>
+<li>sceglie il DNS ricevuto o configurato su Ethernet (se manca, usa <code>8.8.8.8</code>) e lo offre ai client dell'AP tramite il DHCP dell'AP;</li>
+<li>imposta Ethernet come interfaccia predefinita (rotta di default);</li>
+<li>attiva il NAPT sull'interfaccia AP: lo smartphone esce su Internet con l'indirizzo Ethernet dello sniffer.</li>
+</ol>
+<p>Va rifatto a ogni riavvio dell'AP, perch&eacute; il suo server DHCP riparte e perde l'opzione DNS: il firmware lo fa da solo (evento "AP avviato" ed evento "ottenuto IP"). L'avviso <code>napt disabled on esp_netif</code> che compare nel log subito prima dell'attivazione &egrave; normale.</p>
+<p>Per verificare l'uscita su Internet dello sniffer stesso usa <code>/nettest</code>: mostra IP, gateway, DNS e interfaccia predefinita, poi prova una risoluzione DNS (<code>example.com</code>) e una connessione TCP a <code>1.1.1.1:80</code>.</p>
+
+<h2 id="pannello">5. Pannello web</h2>
+<p>Porta 80, sia dall'AP sia dall'IP Ethernet. <b>Non c'&egrave; autenticazione</b> (vedi i limiti).</p>
+<table>
+<tr><th>Indirizzo</th><th>Funzione</th></tr>
+<tr><td><code>/</code></td><td>diagnostica dell'AP: SSID, canale, potenza, paese, MAC, stazioni connesse, heap libero, uptime, contatori di frame di gestione e <i>probe request</i> con gli ultimi probe visti; form "Modifica al volo" per SSID, canale, potenza e SSID nascosto (applicati subito <b>e salvati in NVS</b>); interruttori del filtro, del tap di cattura e della modalit&agrave; promiscua</td></tr>
+<tr><td><code>/net</code></td><td>rete Ethernet: stato reale, scelta DHCP / IP fisso, contenuto di NVS riletto da flash</td></tr>
+<tr><td><code>/net/reset</code></td><td>cancella la configurazione di rete salvata e riavvia con i predefiniti</td></tr>
+<tr><td><code>/filter</code></td><td>editor delle regole di cattura, con contatori per regola e statistiche</td></tr>
+<tr><td><code>/wireshark</code></td><td>comandi da copiare per avviare lo script sul PC e stato dello stream USB</td></tr>
+<tr><td><code>/nettest</code></td><td>prova di DNS e TCP dello sniffer verso Internet</td></tr>
+<tr><td><code>/toggle?tap=0|1</code>, <code>filter=0|1</code>, <code>promisc=0|1</code></td><td>interruttori: tap di cattura (0 = l'AP funziona senza copiare i frame, utile per diagnosi), filtro, modalit&agrave; promiscua per i probe request</td></tr>
+<tr><td><code>/restart</code></td><td>riavvia lo sniffer</td></tr>
+</table>
+
+<h2 id="nvs">6. Configurazione salvata (NVS)</h2>
+<p>La partizione <code>nvs</code> &egrave; da 512 KB. Lo sniffer usa due namespace:</p>
+<table>
+<tr><th>Namespace</th><th>Chiave</th><th>Contenuto</th><th>Predefinito</th></tr>
+<tr><td rowspan="9"><code>netcfg</code></td><td><code>eth_mode</code></td><td>0 = DHCP, 1 = IP fisso</td><td>1</td></tr>
+<tr><td><code>eth_ip</code></td><td>IP fisso</td><td>192.168.137.200</td></tr>
+<tr><td><code>eth_mask</code></td><td>maschera</td><td>255.255.255.0</td></tr>
+<tr><td><code>eth_gw</code></td><td>gateway</td><td>192.168.137.1</td></tr>
+<tr><td><code>eth_dns</code></td><td>DNS</td><td>192.168.137.1</td></tr>
+<tr><td><code>ap_ssid</code></td><td>SSID dell'AP</td><td>LoggerWIFI</td></tr>
+<tr><td><code>ap_ch</code></td><td>canale 1&ndash;13</td><td>6</td></tr>
+<tr><td><code>ap_dbm</code></td><td>potenza 2&ndash;20 dBm</td><td>8</td></tr>
+<tr><td><code>ap_hid</code></td><td>SSID nascosto 0/1</td><td>0</td></tr>
+<tr><td><code>sniffer</code></td><td><code>rules</code></td><td>testo del filtro di cattura (fino a 64 KB)</td><td>regole predefinite (vedi sotto)</td></tr>
+</table>
+<ul>
+<li><b>Verifica a ogni salvataggio</b>: dopo la scrittura e il commit il firmware rilegge da NVS e confronta con quanto scritto; se non coincide, la pagina mostra un errore e il valore non viene considerato salvato. Nel log compare <code>[NETCFG] ... salvato in NVS (verificato)</code>.</li>
+<li><b>All'avvio</b> il log dice <code>[ETH] da NVS: IP fisso</code> (o <code>DHCP</code>) e <code>[AP] da NVS: ...</code>, oppure <code>nessuna configurazione in NVS: predefiniti</code>. Se i valori in NVS non sono validi si torna ai predefiniti, con un avviso nel log.</li>
+<li>La pagina <code>/net</code> elenca le chiavi come sono <b>in flash in quel momento</b>, non quelle in RAM: &egrave; il modo pi&ugrave; rapido per controllare che il salvataggio sia andato a buon fine.</li>
+<li>Il flasher della dashboard conserva le partizioni dati a ogni riflash (vedi la sezione "Riflash senza perdere la configurazione" nella documentazione dell'HC-12): rete, AP e regole sopravvivono all'aggiornamento del firmware. La casella "Cancella tutta la flash" fa invece un ripristino completo.</li>
+</ul>
+
+<h2 id="cattura">7. Cattura e Wireshark</h2>
+<h3>Cosa viene catturato</h3>
+<p>Il firmware si aggancia all'ingresso e all'uscita dell'interfaccia dell'AP: ogni frame Ethernet scambiato con lo smartphone viene (se il filtro lo lascia passare) copiato in un <b>buffer circolare da 4 MB in PSRAM</b> (48 KB in RAM interna se la PSRAM non c'&egrave;). Un task lo svuota verso la <b>USB-Serial-JTAG</b> (buffer di trasmissione da 8 KB, attesa massima di scrittura 20 ms). Il traffico che non passa dall'AP (lato Ethernet) non &egrave; catturato.</p>
+<h3>Formato sul filo</h3>
+<p>Un record per frame, little endian:</p>
+<pre><code>A5 5A | caplen u16 | origlen u16 | dir u8 | rsv u8 | ts_sec u32 | ts_usec u32 | dati[caplen]
+dir: 0 = dallo smartphone verso l'ESP (ingresso AP)   1 = dall'ESP verso lo smartphone (uscita AP)</code></pre>
+<p>Il marcatore <code>A5 5A</code> permette allo script di risincronizzarsi se perde dei byte. Il timestamp parte dall'avvio dell'ESP: lo script lo ancora all'orologio del PC al primo frame ricevuto.</p>
+<h3>Avviare Wireshark</h3>
+<p>Lo script gira <b>sul PC</b>; il pannello non pu&ograve; avviarlo, ma la pagina <code>/wireshark</code> d&agrave; i comandi pronti da copiare (con il campo per la porta COM). Prima volta: <code>pip install pyserial</code>; i comandi si lanciano dalla cartella <code>tools</code> che contiene <code>pcap_bridge.py</code>.</p>
+<table>
+<tr><th>Caso</th><th>Comando</th></tr>
+<tr><td>Wireshark in diretta, <b>cmd</b> di Windows</td><td><code>python pcap_bridge.py COM7 | "C:\Program Files\Wireshark\Wireshark.exe" -k -i -</code></td></tr>
+<tr><td>Wireshark in diretta, <b>PowerShell</b></td><td><code>cmd /c 'python pcap_bridge.py COM7 | "C:\Program Files\Wireshark\Wireshark.exe" -k -i -'</code><br>(la pipe diretta di PowerShell rovina i dati binari: serve <code>cmd /c</code>)</td></tr>
+<tr><td>Solo salvataggio su file</td><td><code>python pcap_bridge.py COM7 --out cattura.pcap</code> (si ferma con Ctrl+C)</td></tr>
+<tr><td>Linux / macOS</td><td><code>python3 pcap_bridge.py /dev/ttyACM0 | wireshark -k -i -</code></td></tr>
+</table>
+<ul>
+<li><code>COM7</code> &egrave; un esempio: usa la porta che in Gestione dispositivi compare come <b>USB JTAG/serial debug unit</b> (la USB nativa, non la UART).</li>
+<li>Una porta COM pu&ograve; essere aperta da un solo programma: chiudi eventuali monitor seriali sulla USB nativa.</li>
+<li>Lo script scrive l'intestazione pcap (microsecondi, Ethernet) e poi un record per frame; in caso di Wireshark chiuso termina e stampa il numero di frame scritti.</li>
+</ul>
+<h3>Stato dello stream</h3>
+<p>La pagina <code>/wireshark</code> e l'heartbeat nel log mostrano: USB connessa (s&igrave;/no), frame e byte inviati al PC, frame catturati dall'avvio, scritture incomplete, spazio libero del buffer e frame scartati perch&eacute; non c'era nessun PC collegato. Frame scartati con il buffer pieno compaiono come <i>scartati</i>.</p>
+<div class="note">I frame vengono scartati (non accumulati) quando la USB non &egrave; collegata o lo script non &egrave; in esecuzione. Il filtro di cattura agisce <b>prima</b> del buffer, quindi i frame esclusi non occupano n&eacute; memoria n&eacute; banda USB.</div>
+
+<h3 id="tls">Vedere il contenuto cifrato (TLS) sul proprio telefono</h3>
+<p>Lo sniffer, da solo, non pu&ograve; leggere il contenuto del traffico <code>https://</code>: cattura i pacchetti cos&igrave; come sono, cifrati. Per leggerli bisogna far passare il traffico del telefono da un programma sul PC che lo <b>decifra e lo ricifra</b> (tecnica detta <i>man in the middle</i>, qui usata sul proprio telefono): <a href="https://mitmproxy.org">mitmproxy</a>. Il telefono deve fidarsi del certificato che mitmproxy genera; come ottenerlo dipende dal fatto che il telefono sia o no con i permessi di root. Le due strade sono <b>complementari</b> alla cattura: lo sniffer continua a registrare i pacchetti per Wireshark, mitmproxy mostra il contenuto decifrato in una sua finestra.</p>
+<div class="warn">Usa queste procedure solo sui <b>tuoi</b> dispositivi, con le <b>tue</b> app o con app che hai il diritto di analizzare, e solo sul tuo traffico. Il certificato installato sul telefono permette di leggere tutto ci&ograve; che passa: toglilo a fine prova. Molte app (banche, pagamenti, streaming) rifiutano di funzionare con un certificato aggiunto o con il root; &egrave; un comportamento voluto, non un guasto dello sniffer.</div>
+
+<h4>Preparazione comune (PC)</h4>
+<ol>
+<li>Installa mitmproxy (<code>pip install mitmproxy</code>, oppure il pacchetto per Windows dal sito) e avvia <code>mitmweb</code>: ascolta sulla porta <code>8080</code> e apre un'interfaccia nel browser.</li>
+<li>Il PC &egrave; sulla stessa rete dello sniffer lato Ethernet (con la condivisione di Windows il suo indirizzo &egrave; <code>192.168.137.1</code>). Il telefono, collegato a <code>LoggerWIFI</code>, raggiunge quell'indirizzo attraverso il NAT dello sniffer. Consenti la porta 8080 nel firewall del PC (rete &laquo;privata&raquo;).</li>
+<li>Sul telefono: Wi-Fi &rarr; <code>LoggerWIFI</code> &rarr; Proxy &laquo;Manuale&raquo; &rarr; host <code>192.168.137.1</code> (o l'IP del PC), porta <code>8080</code>.</li>
+<li>Con il proxy attivo apri nel browser del telefono <code>http://mitm.it</code> e scarica il certificato per Android (<code>.cer</code>/<code>.pem</code>).</li>
+</ol>
+
+<h4>Telefono NON rooted</h4>
+<ol>
+<li><b>Installa il certificato utente</b>: Impostazioni &rarr; Sicurezza (o &laquo;Sicurezza e privacy&raquo;) &rarr; Altre impostazioni &rarr; Crittografia e credenziali &rarr; Installa un certificato &rarr; <b>Certificato CA</b> &rarr; scegli il file. Il percorso esatto cambia da marca a marca; Android avvisa che la rete pu&ograve; essere monitorata.</li>
+<li><b>Cosa funziona</b>: il browser (Chrome si fida dei certificati utente) e le app che li accettano. Da Android 7 in poi le app, per impostazione predefinita, <b>ignorano</b> i certificati utente: vedrai gli errori di connessione nelle app e nulla nel flusso di mitmproxy.</li>
+<li><b>Per le app tue</b> (o di cui hai i sorgenti) basta aggiungere in <code>res/xml/network_security_config.xml</code> la fiducia nei certificati utente (<code>&lt;certificates src="user"/&gt;</code>) e richiamarlo dal manifesto, solo nella versione di debug.</li>
+<li><b>Per app di terzi</b>: lo strumento <code>apk-mitm</code> (richiede Node.js) scarica/legge l'APK, aggiunge la configurazione di rete e cerca di togliere il <i>certificate pinning</i>, poi lo reinstalli. Funziona con molte app ma non con tutte, e l'app modificata ha una firma diversa (niente aggiornamenti dal Play Store, e alcune app non partono).</li>
+<li><b>Alternativa senza modificare il telefono</b>: usa l'emulatore Android del PC (immagine &laquo;Google APIs&raquo;, non &laquo;Play Store&raquo;), dove puoi avere il root e installare il certificato come di sistema, e fai collegare l'emulatore al proxy.</li>
+</ol>
+
+<h4>Telefono rooted (Magisk)</h4>
+<ol>
+<li>Con il root il certificato si installa come <b>certificato di sistema</b>, che tutte le app accettano. Fai prima l'installazione utente come sopra.</li>
+<li><b>Android 13 e precedenti</b>: copia il certificato in <code>/system/etc/security/cacerts/</code> con il nome <code>&lt;hash&gt;.0</code>, dove l'hash si ottiene con <code>openssl x509 -inform PEM -subject_hash_old -in mitmproxy-ca-cert.pem -noout</code>; il percorso &egrave; di sola lettura, quindi di solito si usa un modulo Magisk che lo fa in modo &laquo;systemless&raquo; (ad esempio uno dei moduli &laquo;Always Trust User Certificates&raquo;), senza rimontare la partizione di sistema.</li>
+<li><b>Android 14 e successivi</b>: i certificati di sistema stanno nel modulo Conscrypt (<code>/apex/com.android.conscrypt/cacerts</code>) e il metodo precedente non basta. Servono moduli Magisk aggiornati che copiano i certificati utente anche l&igrave;; verifica nella pagina del modulo che supporti la tua versione di Android.</li>
+<li><b>App con certificate pinning</b> (il certificato di sistema non basta, perch&eacute; l'app accetta solo un certificato preciso): avvia sul telefono <code>frida-server</code> (stessa versione del programma <code>frida</code> sul PC, collegato con <code>adb</code>) e usa uno script che disattiva il pinning, per esempio <code>objection -g nome.pacchetto explore</code> e poi <code>android sslpinning disable</code>, oppure uno script &laquo;universal Android SSL pinning bypass&raquo;. Le app che fanno il pinning in codice nativo (alcune basate su Flutter, per esempio) richiedono script specifici.</li>
+<li><b>App che ignorano il proxy</b> impostato nel Wi-Fi: con il root puoi forzare il traffico verso il proxy con regole <code>iptables</code> (<code>REDIRECT</code> delle porte 80 e 443 verso il PC) e avviare mitmproxy in modalit&agrave; trasparente (<code>mitmproxy --mode transparent</code> su Linux, oppure <code>--mode wireguard</code>, che funziona anche senza root sul telefono con l'app WireGuard).</li>
+</ol>
+
+<h4>Leggere il risultato anche in Wireshark (facoltativo)</h4>
+<p>Se avvii mitmproxy con la variabile d'ambiente <code>SSLKEYLOGFILE=chiavi.log</code>, scrive le chiavi di sessione TLS in quel file. In Wireshark, Modifica &rarr; Preferenze &rarr; Protocolli &rarr; TLS &rarr; <i>(Pre)-Master-Secret log filename</i> con quel file: la cattura dello sniffer relativa alla parte telefono &harr; PC si decifra, con tutti gli altri dettagli (tempi, ritrasmissioni) accanto al contenuto. Lo strumento &egrave; pensato per verificare un caso alla volta: per un'analisi normale &egrave; pi&ugrave; comodo guardare direttamente l'interfaccia di mitmproxy.</p>
+
+<h4>Se non vedi nulla</h4>
+<table>
+<tr><th>Sintomo</th><th>Probabile causa</th></tr>
+<tr><td>Il browser dice &laquo;connessione non privata&raquo;</td><td>certificato non installato come CA, o data/ora del telefono errata</td></tr>
+<tr><td>Il browser funziona, l'app no (errori di rete)</td><td>l'app non accetta certificati utente (Android 7+) oppure fa il pinning</td></tr>
+<tr><td>Nessuna richiesta compare in mitmproxy</td><td>proxy non impostato sul Wi-Fi, firewall del PC sulla porta 8080, indirizzo del PC sbagliato, oppure l'app ignora il proxy (usa la modalit&agrave; trasparente/WireGuard)</td></tr>
+<tr><td>Dopo la prova il telefono non naviga</td><td>togli il proxy dalle impostazioni del Wi-Fi e rimuovi il certificato (Impostazioni &rarr; Crittografia e credenziali &rarr; Credenziali utente)</td></tr>
+</table>
+
+<h2 id="filtro">8. Filtro di cattura</h2>
+<p>Per non inondare Wireshark di traffico inutile (ad esempio quello continuo di Google su Android) le regole si scrivono come testo nella pagina <code>/filter</code>, si salvano in NVS e si applicano subito. Una regola per riga, <code>#</code> inizia un commento, <b>vince la prima regola che combacia</b>; se nessuna combacia, vale <code>default</code>.</p>
+<table>
+<tr><th>Regola</th><th>Significato</th></tr>
+<tr><td><code>default keep|drop</code></td><td>cosa fare se nessuna regola combacia</td></tr>
+<tr><td><code>snaplen N</code></td><td>byte catturati per frame (64&ndash;1600)</td></tr>
+<tr><td><code>drop|keep ip A.B.C.D ...</code></td><td>IPv4 sorgente <b>o</b> destinazione; accetta anche CIDR <code>A.B.C.D/N</code> e pi&ugrave; valori sulla stessa riga</td></tr>
+<tr><td><code>drop|keep src ...</code> / <code>dst ...</code></td><td>solo sorgente / solo destinazione</td></tr>
+<tr><td><code>drop|keep port N|N-M ...</code></td><td>porta TCP/UDP sorgente o destinazione (anche <code>sport</code>, <code>dport</code>)</td></tr>
+<tr><td><code>drop|keep proto tcp udp icmp arp ipv6</code></td><td>per protocollo</td></tr>
+<tr><td><code>drop|keep domain nome ...</code></td><td>per nome di dominio, come suffisso: <code>google.com</code> vale anche per <code>www.google.com</code></td></tr>
+</table>
+<pre><code># esempi
+default keep
+snaplen 96                       # solo le intestazioni
+drop domain google.com youtube.com
+drop port 853                    # DNS su TLS
+drop proto arp
+# per catturare solo un server:
+#   default drop
+#   keep ip 93.184.216.34</code></pre>
+<h3>Come funzionano i domini</h3>
+<p>Un frame non contiene il nome del sito, solo l'IP. Il filtro quindi <b>ascolta le risposte DNS</b> che passano dall'AP (porta 53), e per ogni nome che combacia con una regola di dominio memorizza gli indirizzi IP restituiti (compresi quelli raggiunti tramite CNAME). I frame verso quegli IP seguono poi la regola, per tutta la durata della risposta DNS (limitata tra 5 minuti e 1 ora). La tabella degli IP appresi ha 8192 voci. Anche le query DNS stesse vengono filtrate per nome.</p>
+<div class="warn">Un dominio funziona solo se il suo DNS passa dall'AP <i>dopo</i> l'applicazione della regola: un'app gi&agrave; connessa con un IP in cache non viene riconosciuta finch&eacute; non rif&agrave; la risoluzione. Per i grandi servizi (Google) il filtro predefinito aggiunge anche gli intervalli IP principali, cos&igrave; non dipende dal DNS.</div>
+<h3>Limiti e valori</h3>
+<ul>
+<li>Fino a 4096 regole, testo massimo 64 KB. Le tabelle stanno in PSRAM.</li>
+<li>Il testo predefinito scarta i domini e gli intervalli IP di Google (Android) e tiene tutto il resto, con snaplen 1600.</li>
+<li>La pagina mostra per ogni regola quante volte ha combaciato, i frame scartati/tenuti, gli IP appresi dal DNS, la PSRAM libera e lo stato del buffer di cattura. L'interruttore "filtro off" sulla pagina principale lo esclude senza cancellare le regole.</li>
+<li>"Salva e applica" riporta gli errori di sintassi riga per riga; le righe sbagliate vengono segnalate, non applicate silenziosamente. "Carica regole predefinite" ricarica il testo di fabbrica nell'editor (da salvare).</li>
+</ul>
+
+<h2 id="build">9. Compilazione, flash e monitor</h2>
+<ul>
+<li>Si compila dalla dashboard, come gli altri progetti, con <b>ESP-IDF v5.2.8</b> nel container <code>sniffer_wifi_builder</code>. Il driver ENC28J60 &egrave; il componente <code>espressif/enc28j60</code> (in <code>managed_components</code>, scaricato dal registro dei componenti).</li>
+<li>Scheda con <b>16 MB di flash</b> e <b>8 MB di PSRAM ottale</b> (80 MHz); la PSRAM serve per il buffer di cattura e per le tabelle del filtro.</li>
+<li>Il flasher della dashboard usa la USB/UART della scheda dal browser (Web Serial); il flasher conserva l'NVS.</li>
+</ul>
+<h3>Impostazioni importanti (<code>sdkconfig.defaults</code>)</h3>
+<table>
+<tr><th>Opzione</th><th>Perch&eacute;</th></tr>
+<tr><td><code>CONFIG_ETH_USE_SPI_ETHERNET</code>, <code>CONFIG_ETH_SPI_ETHERNET_ENC28J60</code></td><td>abilitano il driver Ethernet su SPI per l'ENC28J60 (EMAC interno disattivato)</td></tr>
+<tr><td><code>CONFIG_LWIP_IP_FORWARD</code>, <code>CONFIG_LWIP_IPV4_NAPT</code>, <code>..._NAPT_PORTMAP</code></td><td>inoltro dei pacchetti e NAT: senza di essi il NAT non si attiva (il log lo segnala)</td></tr>
+<tr><td><code>CONFIG_SPIRAM*</code> (ottale, 80 MHz)</td><td>PSRAM per buffer di cattura e tabelle del filtro</td></tr>
+<tr><td><code>CONFIG_PARTITION_TABLE_CUSTOM</code></td><td>tabella delle partizioni personalizzata (sotto)</td></tr>
+<tr><td><code>CONFIG_ESP_CONSOLE_UART_DEFAULT</code>, console secondaria disattivata</td><td>il log resta sulla UART e la USB nativa &egrave; libera per la cattura</td></tr>
+<tr><td><code>CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048</code>, <code>CONFIG_HTTPD_MAX_URI_LEN=512</code></td><td>header HTTP pi&ugrave; lunghi: un POST da form di Chrome supera i 512 byte di default ("Header fields are too long")</td></tr>
+<tr><td><code>CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144</code>, <code>CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096</code></td><td>stack dei task principali</td></tr>
+</table>
+<div class="warn"><code>sdkconfig.defaults</code> viene letto solo quando <code>sdkconfig</code> viene rigenerato: dopo aver cambiato un'opzione cancella <code>projects/sniffer_wifi/sdkconfig</code> (e la cartella <code>build</code>) prima di ricompilare, come in "Pulisci build corrotta" nei Comandi utili.</div>
+<h3>Partizioni</h3>
+<table>
+<tr><th>Nome</th><th>Tipo</th><th>Offset</th><th>Dimensione</th></tr>
+<tr><td><code>nvs</code></td><td>data / nvs</td><td>0x9000</td><td>512 KB</td></tr>
+<tr><td><code>phy_init</code></td><td>data / phy</td><td>0x89000</td><td>4 KB</td></tr>
+<tr><td><code>factory</code></td><td>app</td><td>0x90000</td><td>3 MB</td></tr>
+<tr><td><code>storage</code></td><td>data / spiffs</td><td>0x390000</td><td>12 MB</td></tr>
+</table>
+<h3>Monitor e cattura insieme</h3>
+<ul>
+<li>Monitor seriale del log: porta <b>UART</b> (115200 baud), per esempio dalla dashboard.</li>
+<li>Cattura: porta <b>USB nativa</b>, con lo script. Sono due porte COM diverse: collega due cavi.</li>
+<li>Nel log, all'avvio: righe <code>NETCFG</code> (configurazione letta), <code>ETH</code> (link e IP), <code>NAT</code> (DNS offerto, NAPT attivo), <code>CAPTURE</code> e <code>FILTER</code>, poi un heartbeat ogni 10 s.</li>
+</ul>
+
+<h2 id="problemi">10. Problemi frequenti</h2>
+<table>
+<tr><th>Sintomo</th><th>Cosa controllare</th></tr>
+<tr><td><code>esp_eth_driver_install</code> fallita, <code>wrong chip ID</code></td><td>guarda la riga <code>enc28j60: revision: N</code> subito prima. <b>revision 0 o 255</b>: il chip non risponde (MISO/CS errati, alimentazione, GND, RST). <b>revision 5 o 6 (B5/B7) ma ancora &ldquo;wrong chip ID&rdquo;</b>: l'SPI di base funziona ma la lettura dei registri PHY/MAC d&agrave; valori sbagliati: tipico di MISO instabile (saldatura fredda, pista lunga), GND debole o clock troppo alto; verifica che il clock SPI in <code>main.c</code> sia a 4 MHz (con 8 MHz questo errore si &egrave; presentato davvero) e fai un ciclo completo di alimentazione</td></tr>
+<tr><td><code>[ETH] Link Down</code>, nessun IP</td><td>cavo e porta del PC/router; il link impiega un paio di secondi a salire dopo il boot</td></tr>
+<tr><td>Con DHCP non arriva nessun IP</td><td>sul PC Windows la condivisione di connessione deve essere attiva sull'adattatore giusto; su un router verifica che il server DHCP sia attivo. Intanto l'AP e il pannello restano usabili (<code>192.168.4.1</code>)</td></tr>
+<tr><td>"Header fields are too long" salvando da una pagina</td><td>firmware compilato con <code>sdkconfig</code> vecchio: vedi l'avviso sul <code>sdkconfig</code> nella sezione 9</td></tr>
+<tr><td>La pagina smette di rispondere dopo aver cambiato IP</td><td>&Egrave; atteso: riaprila al nuovo indirizzo o dall'AP su <code>192.168.4.1/net</code></td></tr>
+<tr><td>La rete Ethernet &egrave; 192.168.4.x</td><td>si sovrappone all'AP, il NAT non funziona: cambia la rete del router o usa un IP fisso su un'altra rete</td></tr>
+<tr><td>Lo smartphone si connette ma non naviga</td><td>apri <code>/nettest</code>: se DNS o TCP falliscono il problema &egrave; a monte (gateway, condivisione). Nel log cerca <code>[NAT] NAPT attivo</code></td></tr>
+<tr><td>AP poco visibile o instabile</td><td>potenza troppo alta per l'alimentazione (tieni <code>ap_dbm</code> sotto circa 9) e alimentazione/cavo USB di qualit&agrave;</td></tr>
+<tr><td>Wireshark non riceve nulla</td><td>la pagina <code>/wireshark</code> deve dire USB connessa s&igrave; e frame in aumento. Controlla la porta COM (USB nativa, non UART), che nessun altro programma la tenga aperta, <code>pyserial</code> installato e, in PowerShell, l'uso di <code>cmd /c</code></td></tr>
+<tr><td>Nessun frame catturato ma lo smartphone naviga</td><td>tap spento (<code>/toggle?tap=1</code> per riaccenderlo) o filtro che scarta tutto (guarda i contatori in <code>/filter</code>)</td></tr>
+<tr><td>Cattura che perde frame</td><td>la USB nativa &egrave; full speed (12 Mbit/s) e il buffer in PSRAM &egrave; di 4 MB: con traffico intenso usa il filtro o riduci lo snaplen</td></tr>
+</table>
+
+<h2 id="verifiche">11. Cosa &egrave; stato verificato e cosa no</h2>
+<ul>
+<li>Compilato con ESP-IDF v5.2.8 e provato su scheda reale (ESP32-S3 con ENC28J60 rev. B7, 16 MB di flash, 8 MB di PSRAM).</li>
+<li><b>Provato sull'hardware</b> (log seriale): primo avvio con NVS vuota e predefiniti; salvataggio verificato per rilettura con tutti e tre i pulsanti di <code>/net</code>; applicazione a caldo con IP fisso (link e AP invariati); passaggio a DHCP a caldo (IP assegnato da ICS al ritorno del cavo); riavvio con IP fisso e con DHCP, con la configurazione riletta da NVS; salvataggio e riletta dei parametri dell'AP; NAT che si riattiva dopo ogni cambio di IP.</li>
+<li>Logica di validazione e di scrittura/lettura NVS provata anche su PC con un'NVS simulata (maschere non contigue, gateway fuori rete, sovrapposizione con la rete dell'AP, conservazione dei valori fissi passando a DHCP, ripristino dei predefiniti).</li>
+<li><b>Da verificare</b>: un IP fisso diverso da 192.168.137.200 (per esempio dietro un router intermedio reale); parametri AP diversi dai predefiniti dopo un riavvio; il ciclo completo di cattura con Wireshark (la pagina <code>/wireshark</code> e lo script sono pronti, ma la prova con traffico reale va fatta); la banda sostenibile sulla USB nativa con traffico intenso.</li>
+</ul>
+
+<h2 id="limiti">12. Limiti</h2>
+<ul>
+<li><b>Nessuna autenticazione</b>: il pannello non ha password e l'AP &egrave; aperto, quindi chiunque si colleghi a <code>LoggerWIFI</code> (o sia sulla rete Ethernet) pu&ograve; cambiare IP, filtro e riavviare lo sniffer. Usalo in ambienti controllati. Anche gli interruttori e il riavvio sono richieste GET.</li>
+<li><b>Cosa si vede in Wireshark.</b> La cattura copia solo i frame scambiati tra lo smartphone e lo sniffer sul Wi-Fi (<code>LoggerWIFI</code>): non vede il traffico di altri dispositivi sulla rete Ethernet n&eacute; di altri telefoni non collegati all'AP. Quasi tutto il traffico di oggi (siti <code>https://</code>, app) &egrave; cifrato con TLS: i pacchetti si vedono, il contenuto no, quindi niente pagine, password o messaggi. Per leggerlo sul <i>proprio</i> telefono vedi &laquo;Vedere il contenuto cifrato (TLS)&raquo; nella sezione 7. Restano visibili:
+<ul>
+<li>indirizzi IP e porte di origine e destinazione (con quali server parla l'app e con quale servizio: 443 = HTTPS, 53 = DNS);</li>
+<li>il nome del sito, se il telefono usa il DNS in chiaro, oppure nell'handshake TLS iniziale (campo SNI) anche con il DNS cifrato; fa eccezione la tecnologia ECH, per ora poco diffusa, che lo nasconde;</li>
+<li>dimensioni e tempi dei pacchetti (quanto e quando l'app comunica);</li>
+<li>per intero il traffico non cifrato: HTTP semplice, DNS in chiaro, ARP, DHCP.</li>
+</ul></li>
+<li><b>Velocit&agrave; e protocolli.</b> La banda &egrave; limitata dall'ENC28J60 (10 Mbps half duplex) e dal NAT software; i client dell'AP sono al massimo 4. Il NAT instrada solo <b>IPv4</b> (&egrave; il formato di indirizzo classico, come <code>192.168.4.2</code>, usato da quasi tutta la navigazione): il traffico IPv6 dello smartphone non esce verso Internet, ma app e siti ripiegano da soli su IPv4 e di solito non te ne accorgi. In Wireshark compare comunque anche il traffico non IPv4 (ARP, IPv6 locale), perch&eacute; la cattura copia ogni frame dell'AP: &egrave; l'instradamento a fermarsi, non la cattura.</li>
+<li><b>Filtro per dominio e DNS.</b> Nei frame c'&egrave; solo l'indirizzo IP, non il nome del sito: il filtro impara quale IP corrisponde a un dominio leggendo la risposta DNS che passa dall'AP. Le regole <code>domain</code> non scattano quando:
+<ul>
+<li>il telefono usa il <b>DNS cifrato</b> (DoT sulla porta 853, DoH dentro il normale HTTPS): lo sniffer non pu&ograve; leggere la risposta e non impara nessun IP. Su Android succede di solito con &laquo;DNS privato&raquo; attivo, anche in automatico; per verificarlo guarda in <code>/filter</code> il contatore &laquo;IP appresi dal DNS&raquo;: se resta a zero mentre navighi, il DNS &egrave; cifrato. Disattiva &laquo;DNS privato&raquo; sullo smartphone;</li>
+<li>l'app ha gi&agrave; l'indirizzo in <b>cache</b> (risolto prima che la regola fosse attiva): il filtro non l'ha mai visto e quel traffico passa. Si risolve alla scadenza della cache, o riavviando l'app o riattivando il Wi-Fi.</li>
+</ul>
+In alternativa usa regole che non dipendono dal DNS: <code>drop ip A.B.C.D/N</code> per intervalli di indirizzi, <code>drop port 853</code> per scartare il DNS su TLS (il DoH su 443 non si pu&ograve; bloccare per porta).</li>
+<li>Gli indirizzi dell'AP (192.168.4.0/24) non sono configurabili da pannello: la rete Ethernet deve evitarli.</li>
+</ul>
+</body>
+</html>

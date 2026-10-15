@@ -1,0 +1,3 @@
+dependencies:
+  idf: ">=5.0"
+  espressif/enc28j60: "^1.1.0"
